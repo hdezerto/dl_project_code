@@ -9,9 +9,9 @@ import time
 
 from torch.utils.data import random_split, Dataset
 
+from collections import defaultdict
+import random
 import numpy as np
-import matplotlib.pyplot as plt
-import torchvision # For make_grid and denormalizing
 
 # Set device. Use GPU if available else CPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -137,7 +137,8 @@ class TransformedDataset(Dataset):
 
 
 def setup_dataloaders(root_dir='./dataset', val_fraction=0.2, batch_size=32, num_workers=2, pin_memory=True,
-                      train_transform=None, test_transform=None):
+                      train_transform=None, test_transform=None, imbalanced=False, cat_breed_fraction=0.2,
+                      oversample_minority=False):
     """Loads data, splits, and creates DataLoaders."""
     # Load dataset for multi-class breed classification
     base_train_val_dataset = OxfordIIITPet(root=root_dir, split='trainval', target_types='category', download=True)
@@ -151,18 +152,39 @@ def setup_dataloaders(root_dir='./dataset', val_fraction=0.2, batch_size=32, num
     # These subsets will contain (PIL Image, label) tuples
     train_subset_raw, val_subset_raw = random_split(base_train_val_dataset, [num_train_samples_for_split, num_val_samples])
 
-    # Now apply the correct transforms using the wrapper
-    train_subset_multi = TransformedDataset(train_subset_raw, transform=train_transform)
+     # --- Imbalanced logic for train set ---
+    if imbalanced:
+        selection_dataset = OxfordIIITPet(root=root_dir, split='trainval', target_types=['category', 'binary-category'], download=True)
+        # Create a corresponding subset of the selection dataset
+        train_selection_subset = torch.utils.data.Subset(selection_dataset, train_subset_raw.indices)
+        imbalanced_indices = get_imbalanced_indices(train_selection_subset, cat_breed_fraction=cat_breed_fraction)
+        train_subset_multi = TransformedDataset(torch.utils.data.Subset(train_subset_raw, imbalanced_indices), transform=train_transform)
+    else:
+        train_subset_multi = TransformedDataset(train_subset_raw, transform=train_transform)
+
     val_subset_multi = TransformedDataset(val_subset_raw, transform=test_transform)
     test_dataset_multi = TransformedDataset(test_dataset_multi_raw, transform=test_transform)
     
-    print(f"Multi-class Dataset loaded. Training samples: {len(train_subset_multi)}, Validation samples: {len(val_subset_multi)}, Test samples: {len(test_dataset_multi)}")
+    # --- Over-sampling logic ---
+    if oversample_minority:
+        # Get all labels from the train subset
+        labels = [y for _, y in train_subset_multi]
+        class_sample_count = np.array([np.sum(np.array(labels) == t) for t in range(len(set(labels)))])
+        class_weights = 1. / class_sample_count
+        sample_weights = np.array([class_weights[label] for label in labels])
+        sample_weights = torch.from_numpy(sample_weights).float()
+        sampler = torch.utils.data.WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+        train_loader = DataLoader(train_subset_multi, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=pin_memory)
+    else:
+        # shuffle=True shuffles the data each epoch
+        train_loader = DataLoader(train_subset_multi, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
 
-    # Create DataLoader objects for the actual data subsets. shuffle=True shuffles the data each epoch
-    train_loader = DataLoader(train_subset_multi, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
+    # Create DataLoader objects for the actual data subsets
     val_loader = DataLoader(val_subset_multi, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
     test_loader = DataLoader(test_dataset_multi, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
-    
+
+    print(f"Multi-class Dataset loaded. Training samples: {len(train_subset_multi)}, Validation samples: {len(val_subset_multi)}, Test samples: {len(test_dataset_multi)}")
+
     return train_loader, val_loader, test_loader
 
 
@@ -224,7 +246,8 @@ def evaluate_model(model, loader_to_use, criterion, device):
 def run_fine_tuning_strategy_1(num_epochs, lr_fc, lr_backbone, device,
                                train_loader, val_loader, test_loader,
                                num_classes=37, model_save_prefix="strategy1_best_model",
-                               factor=0.1, patience=2, l2_lambda=0.0, batchnorm_mode="default"):
+                               factor=0.1, patience=2, l2_lambda=0.0, batchnorm_mode="default",
+                               use_weighted_loss=False):
     """
     Implements Strategy 1: Fine-tune l layers simultaneously with different LRs.
     """
@@ -236,6 +259,18 @@ def run_fine_tuning_strategy_1(num_epochs, lr_fc, lr_backbone, device,
     best_l_config_for_strategy = None
     
     max_l = 4 # For ResNet18
+
+    # --- Compute class weights if needed ---
+    weights = None
+    if use_weighted_loss:
+        # Compute class frequencies from the train_loader dataset
+        all_labels = []
+        for _, labels in train_loader.dataset:
+            all_labels.append(labels)
+        class_sample_count = np.array([np.sum(np.array(all_labels) == t) for t in range(num_classes)])
+        weight = 1. / class_sample_count
+        weights = torch.FloatTensor(weight).to(device)
+        print(f"Using Weighted Cross-Entropy Loss. Class weights: {weights}")
 
     for l_val in range(1, max_l + 1):
         print(f"\n    STRATEGY 1: Training with FC + last {l_val} ResNet block(s) unfrozen")
@@ -274,7 +309,10 @@ def run_fine_tuning_strategy_1(num_epochs, lr_fc, lr_backbone, device,
         current_model = current_model.to(device)
         
         # Optimizer and Criterion for current l_val
-        criterion = nn.CrossEntropyLoss()
+        if use_weighted_loss and weights is not None:
+            criterion = nn.CrossEntropyLoss(weight=weights)
+        else:
+            criterion = nn.CrossEntropyLoss()
         
         optimizer_grouped_parameters = [{'params': current_model.fc.parameters(), 'lr': lr_fc}]
         if current_backbone_params:
@@ -518,7 +556,6 @@ def run_fine_tuning_strategy_2(lr_fc, lr_backbone, device,
     print(f"Training time: {strategy_duration_minutes:.2f} minutes")
 
 
-
 # --- Run Strategy 2 ---
 
 # These transforms are defined globally above
@@ -555,157 +592,57 @@ run_fine_tuning_strategy_2(
 
 
 
-
 # --------------------- IMBALANCED CLASSES ---------------------
 
-from collections import Counter
-from torch.utils.data import Subset, WeightedRandomSampler
-
-# Step 1: Simulate Imbalanced Classes for Cat Breeds
-def create_imbalanced_dataset_for_cats(dataset, reduction_factor=0.2, cat_breed_indices=None):
+def get_imbalanced_indices(dataset, cat_breed_fraction=0.2):
     """
-    Reduces the number of samples for each cat breed to simulate imbalance.
-    Args:
-        dataset: The original dataset (e.g., train_dataset).
-        reduction_factor: Fraction of samples to keep for each cat breed (e.g., 0.2 for 20%).
-        cat_breed_indices: List of indices corresponding to cat breeds in the dataset.
-    Returns:
-        A subset of the dataset with reduced samples for cat breeds and full samples for dog breeds.
+    Returns indices for an imbalanced subset: only cat_breed_fraction of each CAT breed,
+    but ALL images for dog breeds.
+    Assumes dataset returns (img, (category_label, binary_label))
     """
-    class_counts = Counter([label for _, label in dataset])  # Count samples per class
-    class_indices = {cls: [] for cls in class_counts.keys()}  # Store indices for each class
+    class_to_indices = defaultdict(list)
+    for idx, (_, (category_label, binary_label)) in enumerate(dataset):
+        class_to_indices[category_label].append(idx)
+    selected_indices = []
+    for category_label, indices in class_to_indices.items():
+        # Check the binary label of the first sample for this breed, since all samples of the same breed have the same binary label
+        _, first_binary_label = dataset[indices[0]][1]
+        if first_binary_label == 0:  # Cat breed
+            n_select = max(1, int(len(indices) * cat_breed_fraction))
+            selected_indices.extend(random.sample(indices, n_select))
+        else:  # Dog breed
+            selected_indices.extend(indices)
+    return selected_indices
 
-    # Group indices by class
-    for idx, (_, label) in enumerate(dataset):
-        class_indices[label].append(idx)
+print("Loading imbalanced dataset...")
 
-    # Reduce samples for cat breeds
-    reduced_indices = []
-    for cls, indices in class_indices.items():
-        if cls in cat_breed_indices:  # Apply imbalance only to cat breeds
-            reduced_count = int(len(indices) * reduction_factor)
-            reduced_indices.extend(indices[:reduced_count])  # Keep only a fraction of the samples
-        else:  # Keep all samples for dog breeds
-            reduced_indices.extend(indices)
-
-    print(f"Original dataset size: {len(dataset)}, Reduced dataset size: {len(reduced_indices)}")
-    return Subset(dataset, reduced_indices)
-
-# Define cat breed indices (assuming first 19 classes are cat breeds)
-cat_breed_indices = list(range(19))  # Adjust based on dataset class ordering
-
-# Apply imbalance to the training dataset
-imbalanced_train_dataset = create_imbalanced_dataset_for_cats(
-    train_dataset_multi_raw, reduction_factor=0.2, cat_breed_indices=cat_breed_indices
+imbalanced_train_loader, val_loader, test_loader = setup_dataloaders(
+    train_transform=train_transform_multi,
+    test_transform=test_transform_multi,
+    batch_size=64,
+    imbalanced=True,
+    cat_breed_fraction=0.2,
+    oversample_minority=True # <--- Activate oversampling of minority classes
 )
-imbalanced_train_loader = DataLoader(imbalanced_train_dataset, batch_size=64, shuffle=True)
 
-# Step 2: Train with Normal Cross-Entropy Loss
-print("\n--- Training with Normal Cross-Entropy Loss ---")
-model = resnet18(weights='IMAGENET1K_V1')
-model.fc = nn.Linear(model.fc.in_features, 37)  # Adjust for multi-class classification
-model = model.to(device)
 
-criterion = nn.CrossEntropyLoss()  # Normal cross-entropy loss
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
+# Run Strategy 1 with the imbalanced train loader
+run_fine_tuning_strategy_1(
+    num_epochs=15, # TUNE
+    lr_fc=1e-3, # TUNE
+    lr_backbone=1e-5, # TUNE
+    device=device,
+    train_loader=imbalanced_train_loader,
+    val_loader=val_loader,
+    test_loader=test_loader,
+    num_classes=37,
+    model_save_prefix="strategy1_imbalanced_model",
+    factor=0.1, patience=1, l2_lambda=0.0, # TUNE
+    batchnorm_mode="default",
+    use_weighted_loss=False  # <--- Activate weighted loss
+)
 
-# Train and evaluate
-train_model(num_epochs=15)  # Reuse the train_model function
-test_model()  # Reuse the test_model function
 
-# Step 3: Weighted Cross-Entropy Loss
-def compute_class_weights(dataset, cat_breed_indices):
-    """
-    Computes class weights based on the inverse frequency of each class.
-    Args:
-        dataset: The dataset (e.g., imbalanced_train_dataset).
-        cat_breed_indices: List of indices corresponding to cat breeds in the dataset.
-    Returns:
-        A tensor of class weights.
-    """
-    class_counts = Counter([label for _, label in dataset])
-    total_samples = sum(class_counts.values())
-    class_weights = {cls: total_samples / count for cls, count in class_counts.items()}
-    return torch.tensor([class_weights[cls] for cls in sorted(class_weights.keys())], dtype=torch.float)
 
-# Compute class weights
-class_weights = compute_class_weights(imbalanced_train_dataset, cat_breed_indices)
-print(f"Class weights: {class_weights}")
 
-# Use weighted cross-entropy loss
-criterion_weighted = nn.CrossEntropyLoss(weight=class_weights.to(device))
 
-# Train with weighted loss
-print("\n--- Training with Weighted Cross-Entropy Loss ---")
-model = resnet18(weights='IMAGENET1K_V1')
-model.fc = nn.Linear(model.fc.in_features, 37)
-model = model.to(device)
-
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
-train_model(num_epochs=15)  # Reuse the train_model function
-test_model()  # Reuse the test_model function
-
-# Step 4: Over-Sampling Minority Classes
-def create_sampler(dataset, cat_breed_indices):
-    """
-    Creates a sampler that over-samples minority classes.
-    Args:
-        dataset: The dataset (e.g., imbalanced_train_dataset).
-        cat_breed_indices: List of indices corresponding to cat breeds in the dataset.
-    Returns:
-        A WeightedRandomSampler for the dataset.
-    """
-    class_counts = Counter([label for _, label in dataset])
-    class_weights = {cls: 1.0 / count for cls, count in class_counts.items()}
-    sample_weights = [class_weights[label] for _, label in dataset]
-    return WeightedRandomSampler(sample_weights, num_samples=len(dataset), replacement=True)
-
-# Create sampler and DataLoader
-sampler = create_sampler(imbalanced_train_dataset, cat_breed_indices)
-oversampled_train_loader = DataLoader(imbalanced_train_dataset, batch_size=64, sampler=sampler)
-
-# Train with over-sampling
-print("\n--- Training with Over-Sampling ---")
-model = resnet18(weights='IMAGENET1K_V1')
-model.fc = nn.Linear(model.fc.in_features, 37)
-model = model.to(device)
-
-criterion = nn.CrossEntropyLoss()  # Normal cross-entropy loss
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
-train_model(num_epochs=15)  # Reuse the train_model function
-test_model()  # Reuse the test_model function
-
-# Step 5: Evaluate Per-Class Accuracy
-def evaluate_per_class_accuracy(model, loader, num_classes, device):
-    """
-    Evaluates per-class accuracy.
-    Args:
-        model: The trained model.
-        loader: DataLoader for evaluation.
-        num_classes: Total number of classes.
-        device: Device (CPU or GPU).
-    Returns:
-        A dictionary with per-class accuracy.
-    """
-    model.eval()
-    class_correct = [0] * num_classes
-    class_total = [0] * num_classes
-
-    with torch.no_grad():
-        for imgs, labels in loader:
-            imgs, labels = imgs.to(device), labels.to(device)
-            outputs = model(imgs)
-            _, preds = torch.max(outputs, 1)
-            for label, pred in zip(labels, preds):
-                if label == pred:
-                    class_correct[label] += 1
-                class_total[label] += 1
-
-    per_class_accuracy = {cls: 100 * class_correct[cls] / class_total[cls] if class_total[cls] > 0 else 0
-                          for cls in range(num_classes)}
-    return per_class_accuracy
-
-# Evaluate per-class accuracy
-print("\n--- Evaluating Per-Class Accuracy ---")
-per_class_accuracy = evaluate_per_class_accuracy(model, test_loader, num_classes=37, device=device)
-print(f"Per-Class Accuracy: {per_class_accuracy}")
