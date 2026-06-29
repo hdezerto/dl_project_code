@@ -30,6 +30,10 @@ This repository contains the code notebooks for an image-classification study on
 | ResNet18 with LoRA adapters | 89.26% test accuracy with 71,680 additional trainable parameters |
 | ResNet50 with LoRA adapters | 91.77% test accuracy with 143,360 additional trainable parameters |
 
+## Report
+
+For the full methodology, experiments, and discussion, see the [group project report](docs/project-report.pdf).
+
 ## Setup
 
 Create an environment and install the notebook dependencies:
